@@ -36,3 +36,20 @@ export const MEAT_OPTIONS = [
   { id: 'prosciutto', name: 'Dry-Cured Prosciutto', price: 2.50 },
   { id: 'meatballs', name: 'Handcrafted Beef Meatballs', price: 2.00 },
 ];
+
+export const BEVERAGE_OPTIONS = [
+  { id: 'cola', name: 'Classic Cola (20 oz)', price: 2.49, description: 'Ice-cold fountain cola', icon: 'soda' },
+  { id: 'lemon-lime', name: 'Lemon-Lime Soda (20 oz)', price: 2.49, description: 'Crisp and citrusy', icon: 'soda' },
+  { id: 'root-beer', name: 'Root Beer (20 oz)', price: 2.49, description: 'Creamy, old-fashioned root beer', icon: 'soda' },
+  { id: 'iced-tea', name: 'Fresh Brewed Iced Tea', price: 2.29, description: 'Sweet or unsweet', icon: 'coffee' },
+  { id: 'lemonade', name: 'House Lemonade', price: 2.79, description: 'Squeezed daily', icon: 'coffee' },
+  { id: 'bottled-water', name: 'Bottled Spring Water', price: 1.49, description: '16.9 oz bottle', icon: 'water' },
+];
+
+export const SIDE_OPTIONS = [
+  { id: 'garlic-knots', name: 'Garlic Knots (6)', price: 4.99, description: 'Brushed with garlic butter and parmesan', icon: 'bread' },
+  { id: 'breadsticks', name: 'Cheesy Breadsticks', price: 5.99, description: 'With marinara for dipping', icon: 'bread' },
+  { id: 'wings', name: 'Hickory Wings (8)', price: 8.99, description: 'Smoked, then fired in the stone oven', icon: 'wings' },
+  { id: 'house-salad', name: 'House Garden Salad', price: 5.49, description: 'Greens, tomato, red onion, olives', icon: 'salad' },
+  { id: 'caesar-salad', name: 'Caesar Salad', price: 5.99, description: 'Romaine, parmesan, house croutons', icon: 'salad' },
+];

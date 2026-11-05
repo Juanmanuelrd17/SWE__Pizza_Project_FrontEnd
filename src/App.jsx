@@ -1,36 +1,75 @@
 // src/App.jsx
-// src/App.jsx
 import { useState, useEffect, useRef } from 'react';
 import { supabase } from './supabaseClient';
 import HomeMenu from './HomeMenu';
-import { SIZES, CRUSTS, SAUCE_LEVELS, VEGGIE_OPTIONS, MEAT_OPTIONS } from './menuData';
+import { SAUCE_LEVELS } from './menuData';
 import OrderReceiptModal from './OrderReceiptModal';
-import { getCustomerByPhone, createCustomer } from './api/api';
+import DrinksSidesPage from './DrinksSidesPage';
+import ManagementPage from './ManagementPage';
+import useMenu from './useMenu';
+import { calcTotals, round2 } from './pricing';
+import { runWithOptionalColumns } from './supabaseHelpers';
+import {
+  isPizza,
+  cartCountOf,
+  cartItemToRow,
+  isExtraRow,
+  rowToExtraItem,
+  describeOrderRow,
+  setExtraQuantity,
+  MAX_EXTRA_QUANTITY,
+} from './orderItems';
 
+const STORAGE_KEY = 'mompop-order-draft-v1';
 
-const DEFAULT_PIZZA = {
-  size: SIZES[1], // Medium default
-  crust: CRUSTS[0],
-  sauce: SAUCE_LEVELS[1],
-  selectedVeggies: [],
-  selectedMeats: [MEAT_OPTIONS[0]],
+// Restores an in-progress order after a refresh/crash (NFR-06).
+function loadDraft() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+const EMPTY_CUSTOMER = {
+  name: '',
+  phone: '',
+  streetAddress: '',
+  subdivision: '',
+  nearestIntersection: '',
+  deliveryNotes: '',
+  chargeAccountType: '',
+  orderType: 'delivery',
 };
 
-export default function App() {
+const PAYMENT_METHODS = [
+  { id: 'credit', label: '💳 Credit' },
+  { id: 'debit', label: '🏧 Debit' },
+  { id: 'cash', label: '💵 Cash' },
+  { id: 'check', label: '🧾 Check' },
+];
 
-  // Navigation: 'landing' (Home/Menu showcase) vs 'order' (Customizer flow)
+export default function App() {
+  // Live menu from Supabase `menu_items` (falls back to menuData.js) - FR-12
+  const { menu, reload: reloadMenu } = useMenu();
+
+  // Draft restored from localStorage so a refresh never loses the current order (NFR-06)
+  const [draft] = useState(loadDraft);
+  const DEFAULT_PIZZA = {
+    size: menu.sizes[Math.min(1, menu.sizes.length - 1)],
+    crust: menu.crusts[0],
+    sauce: SAUCE_LEVELS[1],
+    selectedVeggies: [],
+    selectedMeats: menu.meats.length > 0 ? [menu.meats[0]] : [],
+  };
+
+  // Navigation: 'landing' (Home/Menu showcase) | 'order' (Customizer flow) | 'manage' (owner menu management)
   const [currentView, setCurrentView] = useState('landing');
-  const [activeStep, setActiveStep] = useState('details'); // 'details' | 'menu'
+  const [activeStep, setActiveStep] = useState(draft?.activeStep || 'details'); // 'details' | 'builder' | 'extras'
 
   // Customer State
-  const [customerInfo, setCustomerInfo] = useState({
-    name: '',
-    phone: '',
-    streetAddress: '',
-    subdivision: '',
-    nearestIntersection: '',
-    orderType: 'delivery',
-  });
+  const [customerInfo, setCustomerInfo] = useState({ ...EMPTY_CUSTOMER, ...(draft?.customerInfo || {}) });
 
   // Phone number input Validation
   const [searchPhoneError, setSearchPhoneError] = useState('');
@@ -42,9 +81,10 @@ export default function App() {
   const [activeDropdown, setActiveDropdown] = useState(null);
   const [lastAddedPrice, setLastAddedPrice] = useState(null);
 
-  // Cart State
-  const [cart, setCart] = useState([]);
+  // Cart State (restored from the saved draft after a refresh - NFR-06)
+  const [cart, setCart] = useState(Array.isArray(draft?.cart) ? draft.cart : []);
   const [isCartOpen, setIsCartOpen] = useState(false);
+  const [isClearConfirmOpen, setIsClearConfirmOpen] = useState(false);
 
   // Returning Customer & Reorder States
   const [searchPhone, setSearchPhone] = useState('');
@@ -52,12 +92,16 @@ export default function App() {
   const [pastOrders, setPastOrders] = useState([]);
   const [isReturningUser, setIsReturningUser] = useState(false);
   const [lookupMessage, setLookupMessage] = useState(null);
+  const [customerFormError, setCustomerFormError] = useState('');
 
   // Modal & Payment States
   const [isCheckoutModalOpen, setIsCheckoutModalOpen] = useState(false);
   const [selectedPaymentMethod, setSelectedPaymentMethod] = useState('credit');
   const [selectedTipPercent, setSelectedTipPercent] = useState(15);
   const [customTipAmount, setCustomTipAmount] = useState('');
+  const [amountTendered, setAmountTendered] = useState('');
+  const [checkNumber, setCheckNumber] = useState('');
+  const [paymentError, setPaymentError] = useState('');
 
   // Card Details & Saved Payments States
   const [cardForm, setCardForm] = useState({
@@ -92,8 +136,32 @@ export default function App() {
     setCustomerInfo((prev) => ({ ...prev, [name]: value }));
   };
 
-  // new customer ID creation
-  const [customerId, setCustomerId] = useState(null);
+  // new customer ID creation (restored from the draft so an in-progress order stays linked)
+  const [customerId, setCustomerId] = useState(draft?.customerId ?? null);
+
+  // Keep the pizza builder pointing at current menu entries when the live menu loads/changes
+  useEffect(() => {
+    setPizzaBuilder((prev) => {
+      const size = menu.sizes.find((s) => s.label === prev.size?.label) || DEFAULT_PIZZA.size;
+      const crust = menu.crusts.find((c) => c.label === prev.crust?.label) || DEFAULT_PIZZA.crust;
+      const selectedVeggies = menu.veggies.filter((v) => prev.selectedVeggies.some((p) => p.name === v.name));
+      const selectedMeats = menu.meats.filter((m) => prev.selectedMeats.some((p) => p.name === m.name));
+      return { ...prev, size, crust, selectedVeggies, selectedMeats };
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [menu]);
+
+  // Persist the in-progress order so a refresh or crash never loses it (NFR-06)
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        STORAGE_KEY,
+        JSON.stringify({ cart, customerInfo, customerId, activeStep })
+      );
+    } catch {
+      /* storage unavailable - ignore */
+    }
+  }, [cart, customerInfo, customerId, activeStep]);
 
   // Formats the phone number entered into 555-555-5555 as the user types
   const formatPhoneNumber = (value) => {
@@ -137,7 +205,6 @@ export default function App() {
 
   if (cleanPhone.length !== 10) {
     setSearchPhoneError('Please enter a valid 10-digit phone number.');
-    alert('Please enter a valid phone number (10 digit with no letters).');
     return;
   }
 
@@ -146,32 +213,66 @@ export default function App() {
   setSearchPhoneError('');
 
   try {
-    // Look up customer through Spring Boot
-    const foundCustomer = await getCustomerByPhone(cleanPhone);
+    
+    const { data: customerData, error: customerError } = await supabase
+      .from('customers')
+      .select('*')
+      .ilike('phone_number', `%${cleanPhone}%`)
+      .limit(1);
 
-    if (foundCustomer) {
-        setCustomerId(foundCustomer.id);
-        setIsReturningUser(true);
-        setSearchPhoneError('');
+    if (customerError) throw customerError;
 
-        // Pre-fill form fields
-        setCustomerInfo((prev) => ({
-            ...prev,
-            name: `${foundCustomer.firstName || ''} ${foundCustomer.lastName || ''}`.trim(),
-            phone: formatPhoneNumber(foundCustomer.phoneNumber || ''),
-            streetAddress: foundCustomer.address || '',
-            subdivision: foundCustomer.subdivision || '',
-            nearestIntersection: foundCustomer.majorIntersection || '',
+    if (customerData && customerData.length > 0) {
+      const foundCustomer = customerData[0];
+      setCustomerId(foundCustomer.id);
+      setIsReturningUser(true);
+      setSearchPhoneError('');
+
+      // Pre-fill form fields
+      setCustomerInfo((prev) => ({
+        ...prev,
+        name: `${foundCustomer.first_name || ''} ${foundCustomer.last_name || ''}`.trim(),
+        phone: formatPhoneNumber(foundCustomer.phone_number || ''),
+        streetAddress: foundCustomer.address || '',
+        subdivision: foundCustomer.subdivision || '',
+        nearestIntersection: foundCustomer.major_intersection || '',
+        deliveryNotes: foundCustomer.delivery_notes || '',
+        chargeAccountType: foundCustomer.charge_account_type || '',
+      }));
+
+      // Fetch customer's past orders with joined order_items
+      const { data: ordersData, error: ordersError } = await supabase
+        .from('orders')
+        .select('*, order_items(*)')
+        .eq('customer_id', foundCustomer.id)
+        .order('created_at', { ascending: false });
+
+      if (!ordersError && ordersData) {
+        setPastOrders(ordersData);
+      }
+
+      // fetch customer's saved card
+      const { data: cardsData, error: cardsError } = await supabase
+        .from('customer_payment_methods')
+        .select('*')
+        .eq('customer_id', foundCustomer.id)
+        .order('created_at', { ascending: false });
+
+      if(!cardsError && cardsData && cardsData.length > 0) {
+        const formattedCards = cardsData.map((c) => ({
+          id: c.id.toString(),
+          nickname: c.nickname,
+          brand: c.brand,
+          last4: c.last_four,
+          cardholderName: c.cardholder_name,
+          expiry: c.expiry,
         }));
-
-        console.log("Customer found through Spring Boot:", foundCustomer);
-
-        // Order history will be connected to Spring Boot later
-        setPastOrders([]);
-
-        // Saved payment methods will be connected later
+        setSavedCards(formattedCards);
+        setSelectedSavedCardId(formattedCards[0].id); // Defaults selection to latest card
+      } else {
         setSavedCards([]);
         setSelectedSavedCardId(null);
+      }
 
 
       setLookupMessage({
@@ -202,63 +303,95 @@ export default function App() {
   }
 };
 
-// Quick re-order. Add entire past pizza directly into active cart
+// Quick re-order. Add a past pizza, drink, or side directly into the active cart
 const handleReorderPizza = (item) => {
-  // Map database item back to front-end cart
+  if (isExtraRow(item)) {
+    const extra = rowToExtraItem(item);
+    setCart((prev) => {
+      const existing = prev.find((c) => c.id === extra.id);
+      if (!existing) return [...prev, extra];
+      return prev.map((c) =>
+        c.id === extra.id
+          ? { ...c, quantity: c.quantity + extra.quantity, price: (c.unitPrice * (c.quantity + extra.quantity)).toFixed(2) }
+          : c
+      );
+    });
+    setIsCartOpen(true);
+    return;
+  }
+
+  // Map database item back to front-end cart, matching the toppings to the current menu
+  const toppingNames = item.toppings || [];
   const reorderedPizza = {
     id: Date.now(),
-    size: { label: item.size },
-    crust: { label: item.crust },
-    sauce: { label: item.sauce },
-    selectedVeggies: (item.toppings || []).map((name) => ({ name })),
-    selectedMeats: [],
+    size: menu.sizes.find((s) => s.label === item.size) || { label: item.size, price: 0 },
+    crust: menu.crusts.find((c) => c.label === item.crust) || { label: item.crust },
+    sauce: SAUCE_LEVELS.find((s) => s.label === item.sauce) || { label: item.sauce },
+    selectedVeggies: menu.veggies.filter((v) => toppingNames.includes(v.name)),
+    selectedMeats: menu.meats.filter((m) => toppingNames.includes(m.name)),
     price: parseFloat(item.price).toFixed(2),
   };
   setCart((prev) => [...prev, reorderedPizza]);
   setIsCartOpen(true);
 };
 
+// Returning customers get their record updated (FR-03); new customers are registered (FR-02)
+const handleCustomerSubmit = async (e) => {
+  e.preventDefault();
+  const rawDigitsOnly = (customerInfo.phone || '').replace(/\D/g, '');
 
-  // sending customer record to Supabase on submission of form
-  const handleCustomerSubmit = async (e) => {
-    e.preventDefault();
-    const rawDigitsOnly = (customerInfo.phone || '').replace(/\D/g, '');
+  if (rawDigitsOnly.length !== 10) {
+    setFormPhoneError('Please enter a valid 10-digit phone number.');
+    return;
+  }
+  setFormPhoneError('');
 
-    if (rawDigitsOnly.length !== 10) {
-      setFormPhoneError('Please enter a valid 10-digit phone number.');
-      alert('Please enter a valid phone number.');
-      return;
+  if (customerInfo.orderType === 'delivery' && !customerInfo.streetAddress.trim()) {
+    setCustomerFormError('A street address is required for delivery orders.');
+    return;
+  }
+  setCustomerFormError('');
+
+  const nameParts = customerInfo.name.trim().split(/\s+/);
+  const firstName = nameParts[0] || '';
+  const lastName = nameParts.slice(1).join(' ') || '';
+
+  const payload = {
+    first_name: firstName,
+    last_name: lastName,
+    phone_number: rawDigitsOnly,
+    address: customerInfo.streetAddress,
+    subdivision: customerInfo.subdivision,
+    major_intersection: customerInfo.nearestIntersection,
+    delivery_notes: customerInfo.deliveryNotes,
+    charge_account_type: customerInfo.chargeAccountType || null,
+  };
+  const optionalKeys = ['delivery_notes', 'charge_account_type'];
+
+  try {
+    if (!customerId) {
+      const { data, error } = await runWithOptionalColumns(
+        (p) => supabase.from('customers').insert([p]).select(),
+        payload,
+        optionalKeys
+      );
+      if (error) throw error;
+      if (data && data.length > 0) setCustomerId(data[0].id);
+    } else {
+      const { error } = await runWithOptionalColumns(
+        (p) => supabase.from('customers').update(p).eq('id', customerId),
+        payload,
+        optionalKeys
+      );
+      if (error) throw error;
     }
 
-    setFormPhoneError('');
-
-    try {
-          const nameParts = customerInfo.name.trim().split(' ');
-          const firstName = nameParts[0] || '';
-          const lastName = nameParts.slice(1).join(' ') || ''
-          
-          if (!customerId) {
-            const newCustomer = await createCustomer({
-              firstName: firstName,
-              lastName: lastName,
-              phoneNumber: rawDigitsOnly,
-              address: customerInfo.streetAddress,
-              subdivision: customerInfo.subdivision,
-              majorIntersection: customerInfo.nearestIntersection,
-            });
-          
-            setCustomerId(newCustomer.id);
-          
-            console.log("Customer created through Spring Boot:", newCustomer);
-          }
-          
-          setActiveStep('builder');
-          
-          } catch (err) {
-            console.error('Error saving customer:', err.message || err);
-            alert('Failed to save customer details.');
-          }
-          };
+    setActiveStep('builder');
+  } catch (err) {
+    console.error('Error saving customer:', err.message || err);
+    setCustomerFormError('Failed to save customer details. Please check the connection and try again.');
+  }
+};
 
   // Toggle Veggie selection
   const toggleVeggie = (veggie) => {
@@ -321,20 +454,66 @@ const handleReorderPizza = (item) => {
     setPizzaBuilder(pizza);
     setEditingId(pizza.id);
     setIsCartOpen(false);
-    setActiveStep('menu');
+    setCurrentView('order');
+    setActiveStep('builder');
+  };
+
+  // Adds one drink/side, or bumps its quantity if it is already in the cart (FR-06)
+  const handleAddExtra = (extra) => {
+    setCart((prev) => {
+      const existing = prev.find((c) => c.id === extra.id);
+      if (!existing) return [...prev, extra];
+      const quantity = Math.min(existing.quantity + 1, MAX_EXTRA_QUANTITY);
+      return prev.map((c) => (c.id === extra.id ? setExtraQuantity(c, quantity) : c));
+    });
+  };
+
+  // Changes a drink/side quantity from the cart (removes it at 0) - FR-07
+  const handleChangeExtraQuantity = (id, delta) => {
+    setCart((prev) =>
+      prev
+        .map((c) => {
+          if (c.id !== id) return c;
+          const quantity = Math.min(c.quantity + delta, MAX_EXTRA_QUANTITY);
+          return setExtraQuantity(c, quantity);
+        })
+        .filter((c) => isPizza(c) || c.quantity > 0)
+    );
+  };
+
+  // Cancel at any point: wipes the order after the operator confirms (NFR-06)
+  const handleClearOrder = () => {
+    setCart([]);
+    setPizzaBuilder(DEFAULT_PIZZA);
+    setEditingId(null);
+    setLastAddedPrice(null);
+    setIsClearConfirmOpen(false);
+    setIsCartOpen(false);
+    setIsCheckoutModalOpen(false);
   };
 
   const grandTotal = cart.reduce((sum, item) => sum + parseFloat(item.price), 0).toFixed(2);
 
-   // Financial Calculations
-  const subtotalNumber = parseFloat(grandTotal) || 0;
-  const deliveryFee = customerInfo.orderType === 'delivery' ? 3.99 : 0.0;
-  const tax = parseFloat((subtotalNumber * 0.08).toFixed(2));
-  const tipAmount =
-    selectedTipPercent === 'custom'
-      ? parseFloat(customTipAmount) || 0
-      : parseFloat(((subtotalNumber * selectedTipPercent) / 100).toFixed(2));
-  const finalGrandTotal = parseFloat((subtotalNumber + deliveryFee + tax + tipAmount).toFixed(2));
+  // Financial Calculations (shared helper in pricing.js)
+  const {
+    subtotal: subtotalNumber,
+    deliveryFee,
+    tax,
+    tip: tipAmount,
+    total: finalGrandTotal,
+  } = calcTotals({
+    subtotal: parseFloat(grandTotal) || 0,
+    orderType: customerInfo.orderType,
+    tipPercent: selectedTipPercent,
+    customTip: customTipAmount,
+  });
+
+  const isCardPayment = selectedPaymentMethod === 'credit' || selectedPaymentMethod === 'debit';
+  const tenderedNumber = parseFloat(amountTendered);
+  const changeDue =
+    selectedPaymentMethod === 'cash' && Number.isFinite(tenderedNumber)
+      ? Math.max(0, round2(tenderedNumber - finalGrandTotal))
+      : 0;
 
   // Signature Drawing 
   const startDrawing = (e) => {
@@ -406,7 +585,7 @@ const handleReorderPizza = (item) => {
 
     // Check if card information is valid for checkout
   const isCardComplete = () => {
-    if (selectedPaymentMethod === 'cash') return true;
+    if (selectedPaymentMethod === 'cash' || selectedPaymentMethod === 'check') return true;
     if (selectedSavedCardId) return true; // using an existing saved card
 
     const cleanNumber = cardForm.cardNumber.replace(/\D/g, '');
@@ -521,7 +700,7 @@ const handleReorderPizza = (item) => {
     if (cart.length === 0) return;
 
     // Validate card information completion for credit/debit payments
-    if ((selectedPaymentMethod === 'credit' || selectedPaymentMethod === 'debit') && !isCardComplete()) {
+    if (isCardPayment && !isCardComplete()) {
       const cleanNumber = cardForm.cardNumber.replace(/\D/g, '');
       const cleanExpiry = cardForm.expiry.replace(/\D/g, '');
       const cleanCvv = cardForm.cvv.replace(/\D/g, '');
@@ -537,51 +716,85 @@ const handleReorderPizza = (item) => {
       return;
     }
 
-    // Validate Signature
-    if (signatureMode === 'draw' && !hasDrawnSignature) {
-      setSignatureError('Please draw your signature before placing the order.');
-      return;
+    // Validate cash / check payment details (FR-09, NFR-03)
+    setPaymentError('');
+    if (selectedPaymentMethod === 'check') {
+      if (!checkNumber.trim()) {
+        setPaymentError('Enter the check number.');
+        return;
+      }
+      if (!Number.isFinite(tenderedNumber) || tenderedNumber <= 0) {
+        setPaymentError('Enter the check amount.');
+        return;
+      }
+      if (round2(tenderedNumber) < finalGrandTotal) {
+        setPaymentError(`The check amount must cover the total due ($${finalGrandTotal.toFixed(2)}).`);
+        return;
+      }
     }
-    if (signatureMode === 'type' && (!typedSignature.trim() || !signatureAgreed)) {
-      setSignatureError('Please type your name and check the consent box to sign.');
-      return;
+    if (selectedPaymentMethod === 'cash') {
+      if (!Number.isFinite(tenderedNumber) || tenderedNumber <= 0) {
+        setPaymentError('Enter the cash amount received.');
+        return;
+      }
+      if (round2(tenderedNumber) < finalGrandTotal) {
+        setPaymentError(`Cash received must cover the total due ($${finalGrandTotal.toFixed(2)}).`);
+        return;
+      }
+    }
+
+    // Validate Signature (required for card payments only - FR-09/10)
+    if (isCardPayment) {
+      if (signatureMode === 'draw' && !hasDrawnSignature) {
+        setSignatureError('Please draw your signature before placing the order.');
+        return;
+      }
+      if (signatureMode === 'type' && (!typedSignature.trim() || !signatureAgreed)) {
+        setSignatureError('Please type your name and check the consent box to sign.');
+        return;
+      }
     }
 
     setSignatureError('');
     setIsSubmittingOrder(true);
 
     try {
-      // 1. Insert order into Supabase
-      const { data: orderData, error: orderError } = await supabase
-        .from('orders')
-        .insert([
-          {
-            customer_id: customerId,
-            order_type: customerInfo.orderType,
-            payment_method: selectedPaymentMethod,
-            payment_status: selectedPaymentMethod === 'cash' ? 'cash_on_delivery' : 'paid',
-            subtotal: subtotalNumber,
-            delivery_fee: deliveryFee,
-            tax: tax,
-            tip: tipAmount,
-            total_price: finalGrandTotal,
-            status: 'received',
-          },
-        ])
-        .select();
+      const amountPaid = isCardPayment ? finalGrandTotal : round2(tenderedNumber);
+
+      // 1. Insert order into Supabase (amount_tendered / check_number are optional columns)
+      const orderPayload = {
+        customer_id: customerId,
+        order_type: customerInfo.orderType,
+        payment_method: selectedPaymentMethod,
+        payment_status:
+          selectedPaymentMethod === 'cash'
+            ? customerInfo.orderType === 'delivery'
+              ? 'cash_on_delivery'
+              : 'paid_cash'
+            : selectedPaymentMethod === 'check'
+            ? 'paid_by_check'
+            : 'paid',
+        subtotal: subtotalNumber,
+        delivery_fee: deliveryFee,
+        tax: tax,
+        tip: tipAmount,
+        total_price: finalGrandTotal,
+        amount_tendered: amountPaid,
+        check_number: selectedPaymentMethod === 'check' ? checkNumber.trim() : null,
+        status: 'received',
+      };
+
+      const { data: orderData, error: orderError } = await runWithOptionalColumns(
+        (p) => supabase.from('orders').insert([p]).select(),
+        orderPayload,
+        ['amount_tendered', 'check_number']
+      );
 
       if (orderError) throw orderError;
       const newOrderId = orderData[0].id;
 
-      // 2. Format order items
-      const orderItemsToInsert = cart.map((pizza) => ({
-        order_id: newOrderId,
-        size: pizza.size.label,
-        crust: pizza.crust.label,
-        sauce: pizza.sauce.label,
-        toppings: [...(pizza.selectedMeats || []), ...(pizza.selectedVeggies || [])].map((t) => t.name),
-        price: parseFloat(pizza.price),
-      }));
+      // 2. Format order items (pizzas, drinks and sides)
+      const orderItemsToInsert = cart.map((item) => cartItemToRow(item, newOrderId));
 
       // 3. Insert items into 'order_items'
       const { error: itemsError } = await supabase
@@ -592,7 +805,7 @@ const handleReorderPizza = (item) => {
 
       // 4. Capture Signature Data URL if drawn
       let signatureDataUrl = null;
-      if (signatureMode === 'draw' && canvasRef.current) {
+      if (isCardPayment && signatureMode === 'draw' && canvasRef.current) {
         signatureDataUrl = canvasRef.current.toDataURL('image/png');
       }
 
@@ -611,92 +824,33 @@ const handleReorderPizza = (item) => {
         tax,
         tip: tipAmount,
         grandTotal: finalGrandTotal,
+        amountPaid,
+        changeDue: selectedPaymentMethod === 'cash' ? changeDue : 0,
+        checkNumber: selectedPaymentMethod === 'check' ? checkNumber.trim() : '',
+        requiresSignature: isCardPayment,
         signatureMode,
         signatureDataUrl,
         typedSignature,
       });
 
-      // 6. Transition UI
+      // 6. Transition UI and reset the finished order
       setCart([]);
+      setAmountTendered('');
+      setCheckNumber('');
+      setTypedSignature('');
+      setSignatureAgreed(false);
+      setHasDrawnSignature(false);
+      setPastOrders([]);
       setIsCheckoutModalOpen(false);
       setIsReceiptModalOpen(true);
     } catch (err) {
       console.error('Error placing order:', err.message || err);
-      alert('There was an issue saving your order. Check console.');
+      setPaymentError('There was an issue saving the order. Nothing was charged; please try again.');
     } finally {
       setIsSubmittingOrder(false);
     }
   };
 
-  const handleCheckout = async () => {
-    if (cart.length === 0) return;
-    setIsSubmittingOrder(true);
-
-    // breaking down the total
-    const subtotalNumber = parseFloat(grandTotal);
-    const deliveryFee = customerInfo.orderType === 'delivery' ? 3.99 : 0.0;
-    const tax = parseFloat((subtotalNumber * 0.08).toFixed(2));
-    const tip = 0.0; // ** bind to tip buttons later
-    const finalTotal = parseFloat((subtotalNumber + deliveryFee + tax + tip).toFixed(2));
-
-    try {
-      // putting into 'orders' table
-      const { data: orderData, error: orderError } = await supabase
-        .from('orders')
-        .insert([
-          {
-            customer_id: customerId,
-            order_type: customerInfo.orderType,
-            payment_method: 'credit', // default
-            payment_status: 'paid',
-            subtotal: subtotalNumber,
-            delivery_fee: deliveryFee,
-            tax: tax,
-            tip: tip,
-            total_price: finalTotal,
-            status: 'received',
-          },
-        ])
-        .select();
-
-        if (orderError) throw orderError;
-
-        const newOrderId = orderData[0].id;
-        console.log('Order created with ID:', newOrderId);
-
-        // formatting pizzas in the cart for 'order_items" table
-        const orderItemsToInsert = cart.map((pizza) => ({
-          order_id: newOrderId,
-          size: pizza.size.label,
-          crust: pizza.crust.label,
-          sauce: pizza.sauce.label,
-          // store topping names into the JSNOV column
-          toppings: [...pizza.selectedMeats, ...pizza.selectedVeggies].map((t) => t.name),
-          price: parseFloat(pizza.price),
-        }));
-
-       const { data: orderItemsData, error: orderItemsError } = await supabase
-         .from('order_items')
-         .insert(orderItemsToInsert)
-         .select();
-
-         if (orderItemsError) throw orderItemsError;
-         console.log('Order items successfully inserted:', orderItemsData);
-
-         // success UI state updates
-         alert(`Order #${newOrderId} successfully placed! Total: $${finalTotal.toFixed(2)}`);
-         setCart([]);
-         setIsCartOpen(false);
-         setCurrentView('landing');
-
-      } catch (err) {
-        console.error('Error placing order:', err.message || err);
-        alert('There was an issue saving your order. Check console.');
-      } finally {
-        setIsSubmittingOrder(false);
-      }
-      
-  };
 
   // Smooth scroll helper for menu/about anchors
   const navigateToSection = (sectionId) => {
